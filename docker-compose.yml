@@ -1,0 +1,84 @@
+# docker compose up --build                 -> tout l'environnement
+# docker compose up --scale worker=3        -> 3 workers en parallele
+# docker compose --profile test run --rm tests   -> tests (unitaires + integration)
+
+x-backend-env: &backend-env
+  DATABASE_URL: postgresql://jobs:jobs@postgres:5432/jobs
+  REDIS_URL: redis://redis:6379/0
+  SMTP_HOST: mailpit
+  SMTP_PORT: "1025"
+  OUTPUT_DIR: /data/outputs
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: jobs
+      POSTGRES_PASSWORD: jobs
+      POSTGRES_DB: jobs
+    ports: ["${POSTGRES_PORT:-5432}:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobs -d jobs"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]  # persistance de la file
+    ports: ["${REDIS_PORT:-6379}:6379"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Serveur SMTP de test : capture les emails envoyes par la tache send_email.
+  mailpit:
+    image: axllent/mailpit:v1.21
+    ports: ["${MAILPIT_PORT:-8025}:8025"]
+
+  api:
+    build: { context: ., dockerfile: Dockerfile.api, target: runtime }
+    environment: *backend-env
+    ports: ["${API_PORT:-8000}:8000"]
+    volumes: [outputs:/data/outputs]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  worker:
+    build: { context: ., dockerfile: Dockerfile.worker }
+    environment:
+      <<: *backend-env
+      WORKER_PROCESSES: "1"
+    volumes: [outputs:/data/outputs]
+    stop_grace_period: 70s
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  dashboard:
+    build: { context: ./dashboard }
+    ports: ["${DASHBOARD_PORT:-3000}:80"]
+    depends_on: [api]
+
+  tests:
+    profiles: [test]
+    build: { context: ., dockerfile: Dockerfile.api, target: test }
+    environment:
+      TEST_DATABASE_URL: postgresql://jobs:jobs@postgres:5432/jobs_test
+      TEST_REDIS_URL: redis://redis:6379/15
+      REQUIRE_INTEGRATION: "1"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+volumes:
+  pgdata:
+  redisdata:
+  outputs:
